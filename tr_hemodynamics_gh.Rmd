@@ -1,0 +1,763 @@
+---
+title: "tr_hemodynamics"
+author: "Matthew Lawlor"
+date: "5/7/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(modelr)
+library(caret)
+library(e1071)
+library(kernlab)
+library(missRanger)
+library(fmsb)
+```
+
+```{r, echo=FALSE, message = FALSE, warning = FALSE}
+#import data
+empi_full =
+  read.csv("./empi_merged.csv") %>% 
+  mutate(
+    visit_date = as.Date(visit_date, "%m/%d/%y"), 
+    year = format(visit_date, "%Y"),
+    date_tte = as.Date(date_tte, tz="UTC"), 
+    year = format(date_tte, "%Y"),
+    date_rhc = as.Date(date_rhc, tz="UTC"), 
+    year = format(date_rhc, "%Y"),
+    date_hfh = as.Date(date_hfh, "%m/%d/%y"), 
+    year = format(date_hfh, "%Y"),
+    date_intervention = as.Date(date_intervention, "%m/%d/%y"), 
+    year = format(date_intervention, "%Y"),
+    other_proc_date = as.Date(other_proc_date, "%m/%d/%y"), 
+    year = format(other_proc_date, "%Y"),
+    last_alive = as.Date(last_alive, "%m/%d/%y"), 
+    year = format(last_alive, "%Y"),
+    date_death = as.Date(date_death, "%m/%d/%y"), 
+    year = format(date_death, "%Y"),
+    nyha = if_else(nyha > 2, 1, 0, 0),
+    stroke_volume=as.numeric(stroke_volume),
+    pvr = (papm-pcwp_mean)/fick_co,
+    tpg = (papm-pcwp_mean),
+    tapse_pasp = rv_tapse / pasp,
+    tapse_paps = rv_tapse / paps,
+    sprime_pasp = rv_tdi / pasp,
+    sprime_paps = rv_tdi / paps,
+    fac_pasp = rv_fac / pasp,
+    fac_paps = rv_fac/ paps,
+    papi = (paps - papd) / ra_mean,
+    vc_avg = rowMeans(select(., tr_inflow_vc, tr_4ch_vc, tr_any_vc), na.rm = TRUE),
+    meld = transplantr::meld_US(INR = inr, bili = tbili, creat = creatinine, dialysis = esrd),
+    race = tolower(race),
+    gender = tolower(gender),
+    race = if_else(race == "black", "black", "non-black", "non-black"), 
+    gender = if_else(gender == "male", 1, 0, 0),
+    egfr = transplantr::ckd_epi_US(creat = creatinine, age = age, sex = gender, eth = race),
+    ckd = if_else(esrd ==1|egfr < 60, 1, 0, 0),
+    avr = if_else(aortic == 1, 1, 0, 0),
+    tavr = if_else(aortic == 2, 1, 0, 0),
+    mvr = if_else(mitral == 1|mitral == 2, 1, 0, 0),
+    mitraclip = if_else(mitral == 3, 1, 0, 0),
+    tvr = if_else(tricuspid == 1|tricuspid == 2, 1, 0, 0),
+    prior_ttvi = if_else(tricuspid == 3, 1, 0, 0),
+    re_op = if_else(cabg == 1| aortic == 1|mitral == 1|mitral == 2|tricuspid == 1|tricuspid == 2, 1, 0, 0),
+    hx_hfh = if_else(hx_hfh == 1, 1, 0, 0),
+    prior_valve = if_else(prior_valve == 1, 1, 0, 0),
+    tricuspid_intervention = ifelse(is.na(tricuspid_intervention), 0, tricuspid_intervention),
+    type_intervention = ifelse(is.na(type_intervention), 0, type_intervention),
+    tr_cat = case_when(
+      tricuspid_regurg == "torrential"|vc_avg >= 2.1 | tr_pisa_eroa >= 0.80 | doppler_eroa >= 1.15 ~ "torrential",
+      tricuspid_regurg == "massive"|vc_avg >= 1.4 & vc_avg < 2.1 | tr_pisa_eroa >= 0.60 & tr_pisa_eroa < 0.80 | doppler_eroa >= 0.95 & doppler_eroa < 1.15 ~ "massive",
+      tricuspid_regurg == "severe"|tricuspid_regurg == "moderate to severe"|vc_avg >= 0.7 & vc_avg < 1.4 | tr_pisa_eroa >= 0.40 & tr_pisa_eroa < 0.60 | doppler_eroa >= 0.75 & doppler_eroa < 0.95 ~ "severe",
+      tricuspid_regurg == "moderate"|tricuspid_regurg == "mild to moderate"|tricuspid_regurg == "mild"|tricuspid_regurg == "trace"|vc_avg < 0.7|tr_pisa_eroa < 0.40|doppler_eroa < 0.75 ~ "≤moderate"
+      ),
+    tr_cat = fct_relevel(tr_cat, "≤moderate", "severe", "massive", "torrential"),
+    tricuspid_regurg = fct_relevel(tricuspid_regurg, "trace", "mild", "mild to moderate", "moderate", "moderate to severe", "severe", "massive", "torrential"),
+    cvp_cat = if_else(ra_mean >= 13, 1, 0),
+    cvp_tert = case_when(
+      ra_mean > 15 ~ 3,
+      ra_mean > 10 ~ 2,
+      ra_mean <= 10 ~ 1),
+    cvp_quart = case_when(
+      ra_mean > 17 ~ 4,
+      ra_mean > 13 ~ 3,
+      ra_mean > 8 ~ 2,
+      ra_mean <= 8 ~ 1),
+    cvp_high = if_else(cvp_tert == 3, 1, 0),
+    cvp_med = if_else(cvp_tert == 2, 1, 0), 
+    pa_cat = case_when(
+      paps <50 ~ 1, 
+      paps >=50 & pasp >= 50 ~ 2,
+      paps >=50 & pasp < 50 ~ 3,
+      missing = NULL),
+    pa_concordant = if_else(pa_cat == 2, 1, 0),
+    pa_discordant = if_else(pa_cat == 3, 1, 0)
+  ) %>% 
+  drop_na(visit_date)
+
+empi_full = 
+  empi_full %>% 
+  mutate(
+    aortic_stenosis = tolower(aortic_stenosis),
+    mitral_regurg = tolower(mitral_regurg),
+    aortic_stenosis = if_else(str_detect(empi_full$aortic_stenosis, "moderate|moderate to severe|severe|critical"), 1, 0, 0),
+    mitral_regurg = if_else(str_detect(empi_full$mitral_regurg, "Moderate|Moderate to severe|Severe"), 1, 0, 0),
+    left_valve = if_else(aortic_stenosis==1|mitral_regurg==1, 1, 0, 0),
+  )
+
+#add in echo variables papm_echo, pvr_echo, lvot_sv, rvot_sv
+empi_tte =
+  read.csv("./empi_tte.csv") %>% 
+  select(empi, papm_echo, pvr_echo, lvot_sv, rvot_sv, tr_velocity) %>% 
+  mutate(tr_v2 = (tr_velocity^2))
+
+empi_full = 
+  left_join(empi_full, empi_tte, by = "empi")
+
+tr_filtered =
+empi_full %>% 
+  filter(tr_cat != "NA")
+```
+
+```{r}
+empi_hd =
+  empi_full %>% 
+  drop_na(ra_mean, paps, pasp) %>% 
+  mutate(
+    pa_diff = paps - ra_mean
+  ) %>% 
+  mutate_if(is.numeric, list(~na_if(., Inf)))
+  #filter(tr_cat != "≤moderate")
+```
+
+```{r}
+#between group differences for pa_cat
+empi_hd %>% 
+  summarise(
+  n = n_distinct(empi)
+) %>% 
+  knitr::kable()
+
+empi_hd %>% 
+  group_by(pa_cat) %>% 
+  summarise(
+    n = n()
+  ) %>%
+  mutate(prop = prop.table(n)) %>% 
+  knitr::kable()
+
+empi_hd %>% 
+  #group_by(pa_cat) %>% 
+  summarise(
+    mean_age = mean(age, na.rm = TRUE),
+    sd_age = sd(age, na.rm = TRUE),
+    median_age = median(age, na.rm = TRUE),
+    iqr_age = IQR(age, na.rm = TRUE)
+  ) %>% 
+  knitr::kable()
+
+empi_hd %>% 
+  mutate(gender = as.character(gender), gender = recode(gender, "0" =  "female", "1" = "male")) %>% 
+  pivot_longer(gender, names_to = "variable", values_to = "data") %>% #substitute gender:ethnicity for race/ethnicity, but too much missing data
+  drop_na(data) %>%
+  group_by(variable, pa_cat, data) %>%
+  summarise(
+    n = n()) %>% 
+  mutate(prop = prop.table(n)) %>% 
+  knitr::kable()
+
+empi_hd %>% #baseline characteristics
+  select(pa_cat, nyha:prior_valve, ckd, avr, tavr, mvr, mitraclip, tvr, prior_ttvi, re_op, aortic_stenosis, mitral_regurg) %>% 
+  pivot_longer(nyha:mitral_regurg, names_to = "variable", values_to = "data") %>% 
+  drop_na(data) %>% 
+  group_by(variable, pa_cat) %>%
+  summarise(
+    n = n(), 
+    sum= sum(data)
+    ) %>%
+  mutate(proportion = sum / n) %>% 
+  knitr::kable()
+
+empi_hd %>% ##chi-square for parametric
+  select(gender, nyha, hx_hfh, htn, diabetes, atrial_fib, cied, re_op, ckd) %>% 
+  map(~chisq.test(.x, empi_hd$pa_cat)) %>% 
+  map(broom::glance) %>% 
+  map_dfr(~ .x %>% as_tibble(), .id = "name") %>% 
+  select(name, p.value) %>% 
+  knitr::kable()
+
+empi_hd %>% ##fisher for non-parametric
+  select(liver_dz) %>% 
+  map(~fisher.test(.x, empi_hd$pa_cat)) %>% 
+  map(broom::glance) %>% 
+  map_dfr(~ .x %>% as_tibble(), .id = "name") %>% 
+  select(name, p.value) %>% 
+  knitr::kable()
+
+empi_hd %>% #echo variables
+  select(pa_cat, aortic_stenosis,mitral_regurg,left_valve) %>% 
+  pivot_longer(aortic_stenosis:left_valve, names_to = "variable", values_to = "data") %>% 
+  group_by(variable, pa_cat) %>% 
+  summarise(
+    n = n(), 
+    sum= sum(data)
+    ) %>%
+  mutate(proportion = sum / n) %>% 
+  knitr::kable()
+
+empi_hd %>% #echo variables chisq pvalues
+  select(aortic_stenosis, mitral_regurg) %>%
+  map(~fisher.test(.x, empi_hd$pa_cat)) %>% 
+  map(broom::glance) %>% 
+  map_dfr(~ .x %>% as_tibble(), .id = "name") %>% 
+  select(name, p.value) %>% 
+  knitr::kable()
+
+empi_hd %>% 
+  group_by(tr_cat) %>% 
+  summarise(
+    n=n()
+    ) %>% 
+  mutate(
+    freq = n / sum(n)) %>% 
+  knitr::kable()
+
+tr_prop_test= #creating DF without TR cat "NA"
+empi_full %>%
+  mutate(
+    tr_cat = as.numeric(tr_cat),
+    tr_cat = if_else(is.na(tr_cat), 5, tr_cat)
+    )
+
+#prop test for TR cat across procedure usage w/ hybrid probability
+fisher.test(tr_prop_test$tr_cat, tr_prop_test$type_intervention, hybrid=TRUE)
+```
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE}
+#EDA by pa_cat
+hd_model_df =
+  empi_hd %>% 
+  select(empi, pa_cat, age, creatinine, egfr, tbili, albumin, inr, hemoglobin, platelet, meld, lved, lves, lvef_calc, rv_base, rv_mid, rv_tapse, rv_tdi, rv_fac, la_volume_index, ra_volume_index, tv_annular_area, vc_avg, tr_pisa_eroa, doppler_eroa, pasp, papm_echo, lvot_sv, rvot_sv, pvr_echo, ra_mean, ra_v_wave, paps, papd, papm, pcwp_mean, tpg, fick_co, fick_ci, stroke_volume, pvr, tapse_pasp, tapse_paps, sprime_pasp, sprime_paps, fac_pasp, fac_paps, papi) %>% 
+  mutate_if(is.numeric, list(~na_if(., Inf)))
+
+hd_model_df %>% ##test normality (Shapiro-Wilk)
+  select(-empi, -pa_cat) %>% 
+  map(~shapiro.test(.x)) %>% 
+  map(broom::glance) %>% 
+  map_dfr(~ .x %>% as_tibble(), .id = "name") %>% 
+  select(name, p.value) %>% 
+  filter(name != "tr_cat") %>% 
+  knitr::kable()
+
+hd_model_df %>% 
+  select(pa_cat, lved, lves, rv_base, rv_mid, rv_tapse, rv_fac, lvot_sv, ra_mean, ra_v_wave, pcwp_mean) %>% 
+  group_by(pa_cat) %>% 
+  summarise(across(lved:pcwp_mean, list(mean = ~ mean(.x, na.rm = TRUE), sd = ~ sd(.x, na.rm = TRUE)))) %>%
+  pander::pandoc.table(style = "grid", caption = "Variables by PA Category, parametric")
+
+hd_model_df %>% 
+  select(-empi, -lved, -lves, -rv_base, -rv_mid, -rv_tapse, -rv_fac, -lvot_sv, -ra_mean, -ra_v_wave, -pcwp_mean) %>%
+  group_by(pa_cat) %>% 
+  summarise(across(age:papi, list(median = ~ median(.x, na.rm = TRUE), Q1=~quantile(.x, probs = 0.25, na.rm = TRUE), Q3=~quantile(.x, probs = 0.75, na.rm = TRUE)))) %>% 
+  pander::pandoc.table(style = "grid", caption = "Variables by PA Category, nonparametric")
+
+hd_model_df %>% ##univariable analysis oneway anova
+  select(lved, lves, rv_base, rv_mid, rv_tapse, rv_fac, lvot_sv, ra_mean, ra_v_wave, pcwp_mean) %>% 
+  map(~oneway.test(.x ~ hd_model_df$pa_cat, data = hd_model_df)) %>% 
+  map(broom::glance) %>% 
+  map_dfr(~ .x %>% as_tibble(), .id = "name") %>% 
+  select(name, p.value) %>% 
+  filter(name != "type_intervention") %>% 
+  knitr::kable()
+
+hd_model_df %>% ##univariable analysis kruskal-wallis
+  select(-empi, -pa_cat, -lved, -lves, -rv_base, -rv_mid, -rv_tapse, -rv_fac, -lvot_sv, -ra_mean, -ra_v_wave, -pcwp_mean) %>%
+  map(~kruskal.test(.x ~ hd_model_df$pa_cat, data = hd_model_df)) %>% 
+  map(broom::glance) %>% 
+  map_dfr(~ .x %>% as_tibble(), .id = "name") %>% 
+  select(name, p.value) %>% 
+  filter(name != "type_intervention") %>% 
+  knitr::kable()
+```
+
+```{r}
+##invasive vs noninvasive pasp
+#linear model
+linear_mod = lm(paps ~ pasp, data=empi_hd)
+linear_mod %>% 
+  broom::glance()
+
+pasp_lm=
+empi_hd %>% 
+    mutate(
+    pa_cat = factor(pa_cat, labels = c("No PH", "Concordant PH", "Discordant PH"))
+  ) %>% 
+  drop_na(pa_cat) %>% 
+  add_predictions(linear_mod) %>% 
+  ggplot(aes(x = pasp, y = paps)) +
+  geom_point() +
+  geom_line(aes(y=pred, color = "red")) +
+  geom_point(aes(fill = pa_cat, shape=21, stroke=0)) +
+  scale_shape_identity() +
+  scale_fill_discrete() +
+  labs(
+    title="Invasive vs. Noninvasive PASP",
+  x="PASP, noninvasive",
+  y="PASP, invasive",
+  fill="Pulmonary Hypertension") +
+  guides(fill=guide_legend(override.aes=list(shape=21)), color = "none") +
+  theme(legend.position="bottom")
+
+pasp_lm
+ggsave("pasp_lm.jpg", pasp_lm, width = 8, height = 5)
+
+lm_cat = lm(paps ~ pasp + cvp_med + cvp_high, data=empi_hd)
+lm_cat %>% 
+  broom::glance()
+
+lm_int = lm(paps ~ pasp*cvp_med + pasp*cvp_high, data=empi_hd)
+lm_int %>% 
+  broom::glance()
+
+anova(linear_mod, lm_cat)
+anova(lm_cat, lm_int)
+
+cvp_lm=
+empi_hd %>% 
+  add_predictions(lm_int) %>% 
+  mutate(
+    cvp_cat = factor(cvp_cat, labels = c("CVP < 13mmHg", "CVP >= 13mmHg")),
+    cvp_tert = factor(cvp_tert, labels = c("CVP <=10mmHg", "CVP 10-15mmHg", "CVP>15mmHg")),
+    pa_cat = factor(pa_cat, labels = c("No PH", "Concordant PH", "Discordant PH"))
+  ) %>% 
+  drop_na(pa_cat) %>% 
+  ggplot(aes(x = pasp, y = paps)) +
+  geom_line(aes(y=pred, color="red")) +
+  geom_point(aes(fill = pa_cat, shape=21, stroke=0)) +
+  scale_shape_identity() +
+  scale_fill_discrete() +
+  labs(
+    title="Invasive vs. Noninvasive PASP, stratified by CVP",
+  x="PASP, noninvasive",
+  y="PASP, invasive",
+  fill="Pulmonary Hypertension") +
+  facet_wrap(. ~ cvp_tert) +
+  guides(fill=guide_legend(override.aes=list(shape=21)), color = "none")
+  #theme(title = element_text(face = "bold"), axis.title = element_text(face = "bold"), axis.text = element_text(face = "bold"), legend.title  = element_text(face = "bold"), legend.text = element_text(face = "bold"), strip.text.x = element_text(face = "bold"))
+
+cvp_lm
+ggsave("cvp_lm.jpg", cvp_lm, width = 8, height = 5)
+```
+
+```{r}
+#model TR velocity vs invasive PA - CVP (noninvasive v invasive pressure difference)
+empi_lm = 
+  empi_hd %>% 
+  mutate(
+    tr_cat = case_when(
+      tr_cat == "torrential" ~ "torrential",
+      tr_cat == "massive" ~ "massive",
+      tr_cat == "severe"|tr_cat == "≤moderate" ~ "≤severe"
+      )) %>% 
+  drop_na(tr_cat)
+
+linear_mod = lm(pa_diff ~ tr_v2, data=empi_lm)
+linear_mod %>% 
+  broom::glance()
+
+empi_lm %>% 
+  add_predictions(linear_mod) %>% 
+  ggplot(aes(x = tr_v2, y = pa_diff)) +
+  geom_point() +
+  geom_line(aes(y=pred, color = "red"))
+
+int_mod = lm(pa_diff ~ tr_v2*tr_cat, data=empi_lm)
+int_mod %>% 
+  broom::glance()
+
+anova(linear_mod, int_mod)
+
+empi_lm %>% 
+  add_predictions(int_mod) %>% 
+  ggplot(aes(x = tr_v2, y = pa_diff)) +
+  geom_point() +
+  geom_line(aes(y=pred, color = "red")) +
+  facet_wrap(. ~ tr_cat)
+```
+ 
+```{r}
+#box plots
+cvp_boxplot =
+empi_hd %>% 
+  mutate(pa_cat = as.factor(pa_cat)) %>% 
+  ggplot(aes(x=pa_cat, y=ra_mean, fill=pa_cat)) +
+  geom_boxplot() +
+  labs(
+    title = "CVP distribution in PH Groups",
+    y = "Central Venous Pressure (mmHg)",
+    x = "Pulmonary Hypertension"
+  ) +
+  scale_fill_discrete(name = "Pulmonary Hypertension", labels = c("No PH", "Concordant PH", "Discordant PH")) +
+  theme(axis.text.x=element_blank())
+
+cvp_boxplot
+ggsave("cvp_boxplot.jpg", cvp_boxplot, width = 8, height = 5)
+
+empi_hd %>% 
+  select(pa_cat, ra_mean) %>% 
+  group_by(pa_cat) %>% 
+  summarise(across(ra_mean, list(median = ~ median(.x, na.rm = TRUE), Q1=~quantile(.x, probs = 0.25, na.rm = TRUE), Q3=~quantile(.x, probs = 0.75, na.rm = TRUE))))
+
+kruskal.test(ra_mean ~ pa_cat, data=empi_hd) %>% 
+  broom::glance()
+```
+
+```{r}
+#bar charts
+cvp_bars=
+empi_hd %>% 
+  mutate(
+    pa_cat=as.factor(pa_cat),
+    cvp_tert=as.factor(cvp_tert)
+  ) %>% 
+  group_by(pa_cat, cvp_tert) %>% 
+  summarise (n = n()) %>%
+  mutate(proportion = n / sum(n)) %>% 
+  ggplot(aes(x=pa_cat, y=proportion, fill=cvp_tert)) +
+  geom_col(position="dodge", color="black") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "RAP tertiles across PH groups",
+    x = "Pulmonary Hypertension",
+    y = "Percent"
+  ) +
+   scale_x_discrete(
+    breaks = c(1, 2, 3), 
+    labels = c("No PH", "Concordant PH", "Discordant PH")) +
+  scale_fill_discrete(name = "RAP", labels = c("RAP<=10", "RAP>10", "RAP>15"))
+  #theme(title = element_text(face = "bold"), axis.title = element_text(face = "bold"), axis.text = element_text(face = "bold"), legend.title  = element_text(face = "bold"), legend.text = element_text(face = "bold"))
+
+cvp_bars
+ggsave("cvp_bars.jpg", cvp_bars, width = 8, height = 5)
+
+empi_hd %>% 
+  mutate(
+    pa_cat=as.factor(pa_cat),
+    cvp_tert=as.factor(cvp_tert)
+  ) %>% 
+  summarise(pval = fisher.test(pa_cat, cvp_tert)$p.value) %>% 
+  knitr::kable()
+```
+
+```{r}
+#univariable logistic regression for discordant PH vs no PH|concordant PH
+empi_regression=
+empi_hd %>% 
+  select(tr_cat, vc_avg, tr_pisa_eroa, doppler_eroa, lved, lvef_calc, rv_base, rv_mid, rv_tapse, rv_tdi, rv_fac, la_volume_index, ra_volume_index, pasp, ra_mean, ra_v_wave, paps, cvp_cat, cvp_tert, pa_cat, pa_concordant, pa_discordant) %>% 
+  mutate(
+    tr_massive = if_else(tr_cat == "massive", 1, 0, missing=NULL),
+    tr_torrential = if_else(tr_cat == "torrential", 1, 0, missing=NULL),
+    tr_cat = if_else(tr_cat == "massive"|tr_cat == "torrential", 1, 0, missing=NULL),
+    ) %>% 
+  mutate_if(is.numeric, list(~na_if(., Inf)))
+
+empi_regression %>% ##univariable analysis for discordant PH (compared with no PH or concordant PH)
+  select(-cvp_cat, -cvp_tert, -pa_cat, -pa_concordant, -pa_discordant) %>% 
+  map(~glm(empi_regression$pa_discordant ~ .x, data = empi_regression, family=binomial())) %>% 
+  map(broom::tidy) %>% 
+  map_dfr(~ .x %>% as_tibble(), .id = "name") %>% 
+  filter(term != "(Intercept)") %>% 
+  mutate(
+    OR = exp(estimate),
+    OR_CI_upper = exp(estimate + 1.96 * std.error),
+    OR_CI_lower = exp(estimate - 1.96 * std.error)
+  ) %>% 
+  select(name, OR, OR_CI_lower, OR_CI_upper, p.value) %>% 
+  knitr::kable()
+```
+
+```{r}
+#univariable linear regression: additional covariates
+empi_hd %>%
+    select(tr_cat, vc_avg, tr_pisa_eroa, doppler_eroa, lved, lvef_calc, rv_base, rv_mid, rv_tapse, rv_tdi, ra_volume_index, ra_mean, ra_v_wave, papm, papd, pcwp_mean) %>% 
+  mutate(
+    tr_massive = if_else(tr_cat == "massive", 1, 0, missing=NULL),
+    tr_torrential = if_else(tr_cat == "torrential", 1, 0, missing=NULL),
+    tr_cat = if_else(tr_cat == "massive"|tr_cat == "torrential", 1, 0, missing=NULL),
+    ) %>% 
+  mutate_if(is.numeric, list(~na_if(., Inf))) %>% 
+  map(~lm(empi_hd$paps ~ empi_hd$pasp + .x, data = empi_hd)) %>% 
+  map(broom::tidy) %>% 
+  map_dfr(~ .x %>% as_tibble(), .id = "name") %>% 
+  filter(term == ".x") %>% 
+  #filter(term == "empi_hd$pasp") %>% 
+  select(name, estimate, std.error,p.value) %>% 
+  knitr::kable()
+
+lm(paps ~ pasp, data=empi_hd) %>% 
+  broom::tidy()
+```
+
+```{r}
+#univariable linear regression: interaction (none significant)
+empi_hd %>%
+  mutate(tr_cat = if_else(tr_cat == "massive"|tr_cat == "torrential", 1, 0, missing=NULL)) %>% 
+  select(tr_cat, rv_tdi, ra_mean, ra_v_wave) %>% 
+  map(~lm(empi_hd$paps ~ empi_hd$pasp * .x, data = empi_hd)) %>% 
+  map(broom::tidy) %>% 
+  map_dfr(~ .x %>% as_tibble(), .id = "name") %>% 
+  filter(str_detect(term, ":.x")) %>% #fix the filter
+  select(name, estimate, p.value) %>% 
+  knitr::kable()
+```
+
+```{r}
+#SVMs for PAPS (linear model)
+hd_svm =
+  empi_hd %>% 
+  mutate(tr_cat = if_else(tr_cat == "massive"|tr_cat == "torrential", 1, 0, missing=NULL)) %>% 
+  select(tr_cat, rv_tdi, ra_mean, ra_v_wave, pasp, paps) %>% 
+  na.omit()
+
+set.seed(1)
+index = 1: nrow(hd_svm)
+train_index <- sample(index, trunc(length(index)*0.7))
+traind <- hd_svm[train_index, ]
+testd  <- hd_svm[-train_index, ]
+
+#training model w/ cross validation and preprocessing
+control <- trainControl(method="repeatedcv", number=10, repeats=3)
+model <- train(paps~pasp+rv_tdi+ra_mean+ra_v_wave+tr_cat,
+               data=hd_svm, method="svmLinear", preProcess=c("scale","center"), trControl=control, na.rm=TRUE)
+model
+
+#testmodel
+test.features = subset(testd, select=-c(paps))
+test.target = subset(testd, select=paps)[,1]
+
+predictions = predict(model, newdata = test.features)
+## RMSE
+sqrt(mean((test.target - predictions)^2))
+## R2
+cor(test.target, predictions) ^ 2
+
+# rank feature importance
+importance <- varImp(model, scale=F)
+plot(importance)
+
+#tune model
+set.seed(1)
+model_tune = tune.svm(paps~pasp+rv_tdi+ra_mean+ra_v_wave+tr_cat, data=hd_svm,cost=seq(from=0.005, to=1,by=0.005), gamma = 1)
+model_tune
+
+#imputed SVMs w/ random forest (no)
+hd_imputed =
+  empi_hd %>% 
+  mutate(tr_cat = if_else(tr_cat == "massive"|tr_cat == "torrential", 1, 0, missing=NULL)) %>% 
+  select(tr_cat, rv_tdi, ra_mean, ra_v_wave, pasp, paps)
+
+hd_imputed <- missRanger(hd_imputed, formula = . ~ ., pmm.k = 3, num.trees = 100)
+View(hd_imputed)
+
+model_imputed <- train(paps~pasp+rv_tdi+ra_mean+ra_v_wave+tr_cat,
+               data=hd_imputed, method="svmLinear", preProcess=c("scale","center"), trControl=control, na.rm=TRUE)
+
+model_imputed
+importance_imputed <- varImp(model_imputed, scale=F)
+plot(importance_imputed)
+```
+
+```{r}
+#example SVR 
+str(hd_svm)
+
+##SVR w/ preprocessing
+model_svr <- train(
+  paps~pasp+rv_tdi+ra_mean+ra_v_wave+tr_cat,
+  data = hd_svm,
+  method = 'svmLinear',
+  preProcess="scale"
+)
+model_svr
+
+set.seed(1)
+
+##Train and Test
+inTraining <- createDataPartition(hd_svm$paps, p = .80, list = FALSE)
+training <- hd_svm[inTraining,]
+testing  <- hd_svm[-inTraining,]
+
+set.seed(1)
+
+model_train <- train(
+  paps~pasp+rv_tdi+ra_mean+ra_v_wave+tr_cat,
+  data = training,
+  method = 'svmLinear',
+  preProcess = "scale"
+)
+model_train
+
+test.features = subset(testing, select=-c(paps))
+test.target = subset(testing, select=paps)[,1]
+
+predictions = predict(model_train, newdata = test.features)
+
+# RMSE
+sqrt(mean((test.target - predictions)^2))
+
+# R2
+cor(test.target, predictions) ^ 2
+
+##Cross validation
+
+ctrl <- trainControl(
+  method = "cv",
+  number = 10,
+)
+
+model_cv <- train(
+  paps~pasp+rv_tdi+ra_mean+ra_v_wave+tr_cat,
+  data = testing,
+  method = 'svmLinear',
+  preProcess = "scale",
+  trCtrl = ctrl
+)
+model_cv
+
+###CV testing
+test.features = subset(testing, select=-c(paps))
+test.target = subset(testing, select=paps)[,1]
+
+predictions = predict(model_cv, newdata = test.features)
+
+# RMSE
+sqrt(mean((test.target - predictions)^2))
+
+# R2
+cor(test.target, predictions) ^ 2
+
+set.seed(1)
+
+##Tuning Hyperparameters
+tuneGrid <- expand_grid(
+  C = c(0.25, .5, 1),
+  sigma = 0.1
+)
+
+model_tune <- train(
+  paps~pasp+rv_tdi+ra_mean+ra_v_wave+tr_cat,
+  data = testing,
+  method = 'svmLinear',
+  preProcess = "scale",
+  trCtrl = ctrl,
+  tuneGrid = tuneGrid
+)
+model_tune
+```
+
+```{r}
+#radar plot of SVM importance factors
+imps <- as.matrix(varImp(model)$importance)
+imps <- as_tibble(as.matrix(varImp(model)$importance))
+imps$var <- c("PASP, noninvasive", "RV TDI S'", "RA mean", "RA peak", "TR, massive/torrential")
+
+imps=
+  imps %>% 
+  pivot_wider(names_from = "var", values_from = "Overall") %>% 
+  select("PASP, noninvasive", "RV TDI S'", "RA mean", "RA peak", "TR, massive/torrential")
+
+imps <- rbind(rep(100,5) , rep(0,5) , imps)
+
+library("grid")
+library("ggplotify")
+
+radar_plot=
+as.ggplot(~radarchart(imps, pcol=rgb(0,0.2,0.8,0.9) , pfcol=rgb(0,0.2,0.8,0.5), plwd=4)) +
+  annotate("text", x = 0.5, y = 0.95,
+          label = "SVR Importance Indices for invasive PASP", size = 6,
+          color = 'black', angle=0)
+
+radar_plot
+
+```
+
+```{r}
+library(patchwork)
+
+abstract_fig=
+cvp_bars + radar_plot
+
+abstract_fig
+```
+
+```{r}
+#SVR for PAPs (linear)
+
+plot(hd_svm$paps, hd_svm$pasp)
+
+#Regression with SVM
+modelsvm = svm(paps~pasp, data=hd_svm)
+
+#Predict using SVM regression
+predYsvm = predict(modelsvm, hd_svm)
+
+#Overlay SVM Predictions on Scatter Plot
+points(x=hd_svm$paps, y=predYsvm, col = "red", pch=16)
+
+##Calculate parameters of the SVR model
+
+#Find value of W
+W = t(modelsvm$coefs) %*% modelsvm$SV
+W
+#Find value of b
+b = modelsvm$rho
+b
+
+## RMSE for SVR Model
+
+#Calculate RMSE 
+RMSEsvm=rmse(predYsvm, hd_svm$paps)
+RMSEsvm
+
+## Tuning SVR model by varying values of maximum allowable error and cost parameter
+
+#Tune the SVM model
+OptModelsvm=tune(svm, paps~pasp, data=hd_svm,ranges=list(elsilon=seq(0,1,0.1), cost=1:100))
+
+#Print optimum value of parameters
+print(OptModelsvm)
+
+#Plot the perfrormance of SVM Regression model
+plot(OptModelsvm)
+
+## Select the best model out of 1100 trained models and compute RMSE
+
+#Find out the best model
+BstModel=OptModelsvm$best.model
+
+#Predict Y using best model
+PredYBst=predict(BstModel,hd_svm)
+
+#Calculate RMSE of the best model 
+RMSEBst=rmse(PredYBst,hd_svm$paps)
+
+##Calculate parameters of the Best SVR model
+
+#Find value of W
+W = t(BstModel$coefs) %*% BstModel$SV
+W
+#Find value of b
+b = BstModel$rho
+b
+
+## Plotting SVR Model and Tuned Model in same plot
+
+plot(hd_svm$paps, hd_svm$pasp, pch=16)
+points(hd_svm$paps, predYsvm, col = "blue", pch=3)
+points(hd_svm$paps, PredYBst, col = "red", pch=4)
+points(hd_svm$paps, predYsvm, col = "blue", pch=3, type="l")
+points(hd_svm$paps, PredYBst, col = "red", pch=4, type="l")
+```
